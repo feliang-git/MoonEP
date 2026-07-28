@@ -198,6 +198,7 @@ This library is inspired by the following works:
 - [DeepEP](https://github.com/deepseek-ai/DeepEP)
 - [Echo](https://arxiv.org/abs/2603.07685)
 - [UltraEP](https://github.com/Dots-Infra/UltraEP)
+- AcclEP (Alibaba's EP communication library)
 
 ## Citation
 
