@@ -345,8 +345,8 @@ class DispatchKernel:
             idx = j * num_threads + tidx
             if idx < Int32(H):
                 zero_smem[idx] = BFloat16(0)
-        cute.arch.barrier()
         cute.arch.fence_view_async_shared()
+        cute.arch.barrier()
 
         # ----- per-block token range
         tpb = (S + self.num_sms - 1) // self.num_sms

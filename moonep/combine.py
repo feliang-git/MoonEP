@@ -418,7 +418,7 @@ class CombineKernel:
                         # so a warp-level sync is enough to make that arrive cover
                         # all 32 lanes' reads — cross-warp completion is already
                         # gated by the 4-count empty mbarrier.
-                        cute.arch.fence_acq_rel_cta()
+                        cute.arch.fence_view_async_shared()
                         cute.arch.sync_warp()
                         load_pipe.consumer_release(load_state)
                         load_state.advance()

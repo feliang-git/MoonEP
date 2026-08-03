@@ -359,7 +359,7 @@ class GradReduceKernel:
                     # (PipelineTmaAsync signalling thread; consumer_group=4),
                     # so sync_warp makes that arrive cover all 32 lanes' reads;
                     # cross-warp completion is gated by the 4-count empty mbarrier.
-                    cute.arch.fence_acq_rel_cta()
+                    cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     load_pipe.consumer_release(cd_state)
                     cd_state.advance()
