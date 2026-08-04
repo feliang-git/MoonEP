@@ -448,7 +448,7 @@ class CombinePrologueKernel:
                         # arrive cover all 32 lanes' reads — cross-warp
                         # completion is already gated by the 4-count empty
                         # mbarrier.
-                        cute.arch.fence_acq_rel_cta()
+                        cute.arch.fence_view_async_shared()
                         cute.arch.sync_warp()
                         acc_load_pipe.consumer_release(acc_use_state)
                         acc_use_state.advance()
