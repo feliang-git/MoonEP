@@ -25,6 +25,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import make_ptr
 
 from moonep._common import cp_async_bulk_g2s, cross_rank_barrier, grid_sync
+from moonep.alloc_policy import resolve_alloc_policy
 from moonep.constants import KIDX_BITS
 
 
@@ -353,7 +354,11 @@ def _pd_issue_g2s(meta, smem_stage, src_begin, logical_count, mbar):
 class PlanningKernel:
     def __init__(self, R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                  TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                 token_padding, num_sms):
+                 token_padding, num_sms, alloc_policy=None):
+        # alloc_policy is a compile-time constant: None selects the fused
+        # builtin path below, which is emitted verbatim so it stays bit- and
+        # perf-identical to the pre-hook kernel.
+        self.alloc_policy = alloc_policy
         self.R, self.E, self.B, self.S, self.K = R, E, B, S, K
         self.N = self.S * self.K
         self.NvS_capacity, self.NvS, self.num_vblocks = NvS_capacity, NvS, num_vblocks
@@ -668,7 +673,13 @@ class PlanningKernel:
 
                 cute.arch.barrier()
             grid_sync(bar_p, num_sms, tid)
-            if pid == 0:
+            # ---- step 3: allocation policy ------------------------------
+            # The whole region up to the next grid_sync is the policy. With
+            # alloc_policy=None the original fused code runs unchanged; an
+            # injected policy replaces it and the alloc_cumsum derivation --
+            # pure mechanism -- is recomputed from alloc afterwards.
+            if cutlass.const_expr(self.alloc_policy is None):
+              if pid == 0:
                 if tid < 32:
                     lane = tid
                     # balance stays in registers throughout: lane holds
@@ -699,102 +710,133 @@ class PlanningKernel:
                             if lane == 0:
                                 z_tensor[surplus_rank, deficit_rank] = move_tokens
                             cute.arch.sync_warp()
-            grid_sync(bar_p, num_sms, tid)
-            # alloc_by_rank[rank, expert] feeds step4; alloc_prefix[expert, rank]
-            # stores the cumulative counts consumed by C2 binary search.
-            alloc_cumsum = cute.make_tensor(
-                meta.iterator + (PB + ALLOC_SUB),
-                cute.make_layout((E, R), stride=(R, 1)),
-            )
-            alloc_tensor = cute.make_tensor(
-                alloc.iterator,
-                cute.make_layout((R, E), stride=(E, 1)),
-            )
-            s_alloc = cute.make_tensor(
-                scratch.iterator,
-                cute.make_layout((R, epn), stride=(epn, 1)),
-            )
-            for owner_rank in cutlass.range(pid, R, num_sms):
-                expert_base = owner_rank * epn
+              grid_sync(bar_p, num_sms, tid)
+              # alloc_by_rank[rank, expert] feeds step4; alloc_prefix[expert, rank]
+              # stores the cumulative counts consumed by C2 binary search.
+              alloc_cumsum = cute.make_tensor(
+                  meta.iterator + (PB + ALLOC_SUB),
+                  cute.make_layout((E, R), stride=(R, 1)),
+              )
+              alloc_tensor = cute.make_tensor(
+                  alloc.iterator,
+                  cute.make_layout((R, E), stride=(E, 1)),
+              )
+              s_alloc = cute.make_tensor(
+                  scratch.iterator,
+                  cute.make_layout((R, epn), stride=(epn, 1)),
+              )
+              for owner_rank in cutlass.range(pid, R, num_sms):
+                  expert_base = owner_rank * epn
 
-                for idx in cutlass.range(tid, epn * R, num_threads):
-                    local_expert_id = idx // R
-                    rank_idx = idx - local_expert_id * R
-                    global_expert = expert_base + local_expert_id
-                    s_alloc[rank_idx, local_expert_id] = (
-                        tpe_cumsum[R - 1, global_expert] if rank_idx == owner_rank else 0
-                    )
+                  for idx in cutlass.range(tid, epn * R, num_threads):
+                      local_expert_id = idx // R
+                      rank_idx = idx - local_expert_id * R
+                      global_expert = expert_base + local_expert_id
+                      s_alloc[rank_idx, local_expert_id] = (
+                          tpe_cumsum[R - 1, global_expert] if rank_idx == owner_rank else 0
+                      )
 
-                cute.arch.barrier()
+                  cute.arch.barrier()
 
-                if tid < 32:
-                    lane = tid
-                    R_CHUNK = cutlass.const_expr(ceil_div(R, 32))
-                    EPN_CHUNK = cutlass.const_expr(ceil_div(epn, 32))
-                    quotas = cute.make_rmem_tensor(R_CHUNK, Int32)
-                    owner_remaining = cute.make_rmem_tensor(EPN_CHUNK, Int32)
-                    for j in cutlass.range_constexpr(R_CHUNK):
-                        rank_idx = lane + j * 32
-                        quotas[j] = 0
-                        if rank_idx < R: quotas[j] = z_tensor[owner_rank, rank_idx]
-                    for j in cutlass.range_constexpr(EPN_CHUNK):
-                        local_expert_id = lane + j * 32
-                        owner_remaining[j] = 0
-                        if local_expert_id < epn:
-                            owner_remaining[j] = s_alloc[owner_rank, local_expert_id]
+                  if tid < 32:
+                      lane = tid
+                      R_CHUNK = cutlass.const_expr(ceil_div(R, 32))
+                      EPN_CHUNK = cutlass.const_expr(ceil_div(epn, 32))
+                      quotas = cute.make_rmem_tensor(R_CHUNK, Int32)
+                      owner_remaining = cute.make_rmem_tensor(EPN_CHUNK, Int32)
+                      for j in cutlass.range_constexpr(R_CHUNK):
+                          rank_idx = lane + j * 32
+                          quotas[j] = 0
+                          if rank_idx < R: quotas[j] = z_tensor[owner_rank, rank_idx]
+                      for j in cutlass.range_constexpr(EPN_CHUNK):
+                          local_expert_id = lane + j * 32
+                          owner_remaining[j] = 0
+                          if local_expert_id < epn:
+                              owner_remaining[j] = s_alloc[owner_rank, local_expert_id]
 
-                    keep_balancing = cutlass.Boolean(True)
-                    while keep_balancing:
-                        max_quota, target_rank = reg_scan_argmax_min_idx(quotas, R, lane)
-                        if max_quota <= 0:
-                            keep_balancing = cutlass.Boolean(False)
-                        else:
-                            max_remaining, selected_expert_id = reg_scan_argmax_min_idx(
-                                owner_remaining, epn, lane)
-                            if max_remaining <= 0:
-                                keep_balancing = cutlass.Boolean(False)
-                            else:
-                                take = cutlass.min(max_remaining, max_quota)
-                                for j in cutlass.range_constexpr(R_CHUNK):
-                                    rank_idx = lane + j * 32
-                                    if rank_idx == target_rank: quotas[j] = max_quota - take
-                                for j in cutlass.range_constexpr(EPN_CHUNK):
-                                    local_expert_id = lane + j * 32
-                                    if local_expert_id == selected_expert_id:
-                                        owner_remaining[j] = max_remaining - take
-                                if tid == 0:
-                                    s_alloc[target_rank, selected_expert_id] += take
-                                    s_alloc[owner_rank, selected_expert_id] = max_remaining - take
-                                cute.arch.sync_warp()
-                cute.arch.barrier()
+                      keep_balancing = cutlass.Boolean(True)
+                      while keep_balancing:
+                          max_quota, target_rank = reg_scan_argmax_min_idx(quotas, R, lane)
+                          if max_quota <= 0:
+                              keep_balancing = cutlass.Boolean(False)
+                          else:
+                              max_remaining, selected_expert_id = reg_scan_argmax_min_idx(
+                                  owner_remaining, epn, lane)
+                              if max_remaining <= 0:
+                                  keep_balancing = cutlass.Boolean(False)
+                              else:
+                                  take = cutlass.min(max_remaining, max_quota)
+                                  for j in cutlass.range_constexpr(R_CHUNK):
+                                      rank_idx = lane + j * 32
+                                      if rank_idx == target_rank: quotas[j] = max_quota - take
+                                  for j in cutlass.range_constexpr(EPN_CHUNK):
+                                      local_expert_id = lane + j * 32
+                                      if local_expert_id == selected_expert_id:
+                                          owner_remaining[j] = max_remaining - take
+                                  if tid == 0:
+                                      s_alloc[target_rank, selected_expert_id] += take
+                                      s_alloc[owner_rank, selected_expert_id] = max_remaining - take
+                                  cute.arch.sync_warp()
+                  cute.arch.barrier()
 
-                for idx in cutlass.range(tid, epn * R, num_threads):
-                    rank_idx = idx // epn
-                    local_expert_id = idx - rank_idx * epn
-                    global_expert = expert_base + local_expert_id
-                    alloc_tensor[rank_idx, global_expert] = (
-                        s_alloc[rank_idx, local_expert_id]
-                    )
+                  for idx in cutlass.range(tid, epn * R, num_threads):
+                      rank_idx = idx // epn
+                      local_expert_id = idx - rank_idx * epn
+                      global_expert = expert_base + local_expert_id
+                      alloc_tensor[rank_idx, global_expert] = (
+                          s_alloc[rank_idx, local_expert_id]
+                      )
 
-                cute.arch.barrier()
+                  cute.arch.barrier()
 
-                for local_expert_id in cutlass.range(tid, epn, num_threads):
-                    cum = 0
-                    for rank_idx in cutlass.range_constexpr(R):
-                        cum += s_alloc[rank_idx, local_expert_id]
-                        s_alloc[rank_idx, local_expert_id] = cum
+                  for local_expert_id in cutlass.range(tid, epn, num_threads):
+                      cum = 0
+                      for rank_idx in cutlass.range_constexpr(R):
+                          cum += s_alloc[rank_idx, local_expert_id]
+                          s_alloc[rank_idx, local_expert_id] = cum
 
-                cute.arch.barrier()
+                  cute.arch.barrier()
 
-                for idx in cutlass.range(tid, epn * R, num_threads):
-                    local_expert_id = idx // R
-                    rank_idx = idx - local_expert_id * R
-                    global_expert = expert_base + local_expert_id
-                    alloc_cumsum[global_expert, rank_idx] = (
-                        s_alloc[rank_idx, local_expert_id]
-                    )
+                  for idx in cutlass.range(tid, epn * R, num_threads):
+                      local_expert_id = idx // R
+                      rank_idx = idx - local_expert_id * R
+                      global_expert = expert_base + local_expert_id
+                      alloc_cumsum[global_expert, rank_idx] = (
+                          s_alloc[rank_idx, local_expert_id]
+                      )
 
-                cute.arch.barrier()
+                  cute.arch.barrier()
+            else:
+              # Injected policy: it owns z[R,R] and alloc[R,E] only. Views are
+              # rebuilt here rather than hoisted so the builtin branch above
+              # stays byte-for-byte the code it was before the hook existed.
+              alloc_tensor = cute.make_tensor(
+                  alloc.iterator,
+                  cute.make_layout((R, E), stride=(E, 1)),
+              )
+              alloc_cumsum = cute.make_tensor(
+                  meta.iterator + (PB + ALLOC_SUB),
+                  cute.make_layout((E, R), stride=(R, 1)),
+              )
+              s_alloc = cute.make_tensor(
+                  scratch.iterator,
+                  cute.make_layout((R, epn), stride=(epn, 1)),
+              )
+              self.alloc_policy(
+                  group_tokens, z_tensor, alloc_tensor, tpe_cumsum, s_alloc,
+                  R=R, E=E, epn=epn, CAP=CAP, bar=bar_p, num_sms=num_sms,
+                  num_threads=num_threads, pid=pid, tid=tid,
+              )
+              grid_sync(bar_p, num_sms, tid)
+              # Mechanism, not policy: alloc_cumsum[e, d] = sum_{d'<=d} alloc[d', e],
+              # consumed by the C2 binary search that resolves each token's dest.
+              # The builtin branch fuses this into its shared-memory pass; here we
+              # recompute it from alloc so any policy gets it for free.
+              for e in cutlass.range(pid * num_threads + tid, E, num_sms * num_threads):
+                  cum = Int32(0)
+                  for d in cutlass.range_constexpr(R):
+                      cum += alloc_tensor[d, e]
+                      alloc_cumsum[e, d] = cum
             grid_sync(bar_p, num_sms, tid)
             expert_offsets = cute.make_tensor(
                 meta.iterator + (PB + EOFF_SUB),
@@ -1138,10 +1180,13 @@ class PlanningKernel:
 @functools.lru_cache(maxsize=None)
 def _get_compiled(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                   TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                  token_padding, num_sms):
+                  token_padding, num_sms, alloc_policy_name=None):
+    # alloc_policy_name (a str, hence hashable) is part of the cache key; the
+    # policy is resolved to its device function only after the cache lookup.
     k = PlanningKernel(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                       token_padding, num_sms)
+                       token_padding, num_sms,
+                       alloc_policy=resolve_alloc_policy(alloc_policy_name))
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     return cute.compile(k, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
                         i32, i32, i32, i32, Int32(0), cuda.CUstream(0))
@@ -1168,6 +1213,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         int(ctx['ORDER0_OFF']),
         int(ctx['token_padding']),
         int(ctx['num_sms']),
+        ctx.get('alloc_policy'),
     )
 
     def p16(t):  # large buffers 16B aligned -> allows coalesced/vectorized access

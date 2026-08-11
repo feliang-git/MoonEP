@@ -61,6 +61,7 @@ from .buffer import (
     get_vmm_granularity,
     get_multicast_granularity,
 )
+from .alloc_policy import BUILTIN, resolve_alloc_policy
 from .constants import DEDUP_BUILDER_WARPS
 from .planning import MoonEPCommPlan, allocate_planning_outputs, launch_planning
 from .inter_rank_sync import launch_inter_rank_sync
@@ -220,6 +221,7 @@ def _create_context(
     token_padding: int = 128,
     B: int | None = None,
     group: "dist.ProcessGroup | None" = None,
+    alloc_policy: str = BUILTIN,
 ) -> dict:
     """Pre-allocate all NVLink shared buffers and local temp buffers.
 
@@ -261,6 +263,9 @@ def _create_context(
     assert E % R == 0, f"E ({E}) must be divisible by R ({R})"
     assert isinstance(token_padding, int) and token_padding > 0, \
         f"token_padding must be a positive int, got {token_padding}"
+    # Resolve now so an unknown policy name fails at Buffer construction rather
+    # than at the first dispatch, deep inside kernel compilation.
+    resolve_alloc_policy(alloc_policy)
     if B is None:
         B = epn
     assert isinstance(B, int) and B > 0, f"B must be a positive int, got {B}"
@@ -393,6 +398,7 @@ def _create_context(
         'num_sms': num_sms,
         'num_sms_dedup': num_sms_dedup,
         'token_padding': token_padding,
+        'alloc_policy': alloc_policy,
         'device': device,
         'token_padding_extra': token_padding_extra,
         # NVLink shared
@@ -450,6 +456,7 @@ class Buffer:
         comm_stream_priority: int = -1,
         enable_pdl: bool = True,
         explicitly_destroy: bool = False,
+        alloc_policy: str = BUILTIN,
     ):
         """Allocate and hold all communication buffers.
 
@@ -473,6 +480,11 @@ class Buffer:
                 False falls back to plain same-stream serial launches.
             explicitly_destroy: if True, warn (instead of auto-destroying)
                 when the Buffer is garbage-collected without ``destroy()``.
+            alloc_policy: name of the allocation policy used by planning step
+                3. ``"builtin"`` (the default) emits MoonEP's original fused
+                code unchanged; other names resolve through
+                ``moonep.alloc_policy`` and are inlined into the same kernel.
+                See ``docs/alloc_policy_contract.md``.
         """
         assert isinstance(comm_stream_priority, int), (
             f"comm_stream_priority must be an int, got "
@@ -492,6 +504,7 @@ class Buffer:
             token_padding=token_padding,
             B=B,
             group=group,
+            alloc_policy=alloc_policy,
         )
         self._comm_stream = torch.cuda.Stream(
             device=int(self._ctx['device']),

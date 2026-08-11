@@ -22,14 +22,18 @@ from tests.kernel_test_utils import (
 
 
 def setup():
-    # conftest's dist_env fixture may already have initialized the group when
-    # this module runs as part of the full suite; an unguarded init here makes
-    # `pytest tests/` fail even though the file passes standalone.
-    if not dist.is_initialized():
+    """Join the process group, creating it only if nobody else has.
+
+    conftest's session-scoped dist_env fixture may already have initialized the
+    group when this module runs as part of the full suite. Returns whether we
+    own the group, so teardown can avoid destroying one we merely borrowed.
+    """
+    owns_group = not dist.is_initialized()
+    if owns_group:
         dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     torch.cuda.set_device(local_device_index())
-    return rank, dist.get_world_size()
+    return rank, dist.get_world_size(), owns_group
 
 
 def make_inputs(rank, S, H, K, E, seed=0):
@@ -218,7 +222,7 @@ def assert_raises_assertion(expected_substr, fn):
 
 
 def test_e2e():
-    rank, R = setup()
+    rank, R, owns_group = setup()
     S, H, K, E = 256, 1024, 4, R * 4
     B = 2
     Hp = 128
@@ -418,7 +422,8 @@ def test_e2e():
         print("[test_e2e] PASS: public API sync/async, separate prefetch, and plan reuse match.")
 
     buffer.destroy()
-    dist.destroy_process_group()
+    if owns_group:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
