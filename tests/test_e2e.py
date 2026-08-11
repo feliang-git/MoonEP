@@ -22,7 +22,11 @@ from tests.kernel_test_utils import (
 
 
 def setup():
-    dist.init_process_group(backend="nccl")
+    # conftest's dist_env fixture may already have initialized the group when
+    # this module runs as part of the full suite; an unguarded init here makes
+    # `pytest tests/` fail even though the file passes standalone.
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     torch.cuda.set_device(local_device_index())
     return rank, dist.get_world_size()
