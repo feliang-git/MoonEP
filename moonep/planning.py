@@ -351,14 +351,177 @@ def _pd_issue_g2s(meta, smem_stage, src_begin, logical_count, mbar):
         )
 
 
+# ============================================================
+# Step 3: the allocation policy
+# ============================================================
+# Selected in Python at PlanningKernel construction and called unconditionally
+# from the kernel. It is deliberately NOT a `cutlass.const_expr` branch inside
+# the kernel body: wrapping this region in a DSL conditional costs 14-22% on
+# skewed inputs, where the greedy while-loops iterate most. Resolving the
+# choice before tracing keeps the emitted builtin path exactly what it was.
+
+
+@cute.jit
+def builtin_greedy_step3(
+    group_tokens, z_tensor, alloc, alloc_cumsum, tpe_cumsum, s_alloc,
+    *, R, E, epn, CAP, bar_p, num_sms, num_threads, pid, tid,
+):
+    """MoonEP's fused greedy policy: balance -> z -> alloc, cumsum fused in."""
+    if pid == 0:
+      if tid < 32:
+          lane = tid
+          # balance stays in registers throughout: lane holds
+          # bal[j]=group_tokens[lane+j*32]-CAP, CHUNK=ceil(R/32).
+          CHUNK = cutlass.const_expr(ceil_div(R, 32))
+          balance = cute.make_rmem_tensor(CHUNK, Int32)
+          for j in cutlass.range_constexpr(CHUNK):
+              k = lane + j * 32
+              balance[j] = 0
+              if k < R: balance[j] = group_tokens[k] - CAP
+          keep_balancing = True
+          while keep_balancing:
+              # surplus takes max (larger balance first, smaller rank
+              # on ties); deficit takes min (larger shortfall first,
+              # smaller rank on ties).
+              surplus, surplus_rank = reg_scan_argmax_min_idx(balance, R, lane)
+              deficit, deficit_rank = reg_scan_argmin_min_idx(balance, R, lane)
+              if surplus <= 0 or deficit >= 0:
+                  keep_balancing = False
+              else:
+                  # The move amount is limited by the receiver's
+                  # shortfall; refill deficit_rank back to CAP in one shot.
+                  move_tokens = -deficit
+                  for j in cutlass.range_constexpr(CHUNK):
+                      k = lane + j * 32
+                      if k == surplus_rank: balance[j] -= move_tokens
+                      elif k == deficit_rank: balance[j] = 0
+                  if lane == 0:
+                      z_tensor[surplus_rank, deficit_rank] = move_tokens
+                  cute.arch.sync_warp()
+    grid_sync(bar_p, num_sms, tid)
+    for owner_rank in cutlass.range(pid, R, num_sms):
+        expert_base = owner_rank * epn
+
+        for idx in cutlass.range(tid, epn * R, num_threads):
+            local_expert_id = idx // R
+            rank_idx = idx - local_expert_id * R
+            global_expert = expert_base + local_expert_id
+            s_alloc[rank_idx, local_expert_id] = (
+                tpe_cumsum[R - 1, global_expert] if rank_idx == owner_rank else 0
+            )
+
+        cute.arch.barrier()
+
+        if tid < 32:
+            lane = tid
+            R_CHUNK = cutlass.const_expr(ceil_div(R, 32))
+            EPN_CHUNK = cutlass.const_expr(ceil_div(epn, 32))
+            quotas = cute.make_rmem_tensor(R_CHUNK, Int32)
+            owner_remaining = cute.make_rmem_tensor(EPN_CHUNK, Int32)
+            for j in cutlass.range_constexpr(R_CHUNK):
+                rank_idx = lane + j * 32
+                quotas[j] = 0
+                if rank_idx < R: quotas[j] = z_tensor[owner_rank, rank_idx]
+            for j in cutlass.range_constexpr(EPN_CHUNK):
+                local_expert_id = lane + j * 32
+                owner_remaining[j] = 0
+                if local_expert_id < epn:
+                    owner_remaining[j] = s_alloc[owner_rank, local_expert_id]
+
+            keep_balancing = cutlass.Boolean(True)
+            while keep_balancing:
+                max_quota, target_rank = reg_scan_argmax_min_idx(quotas, R, lane)
+                if max_quota <= 0:
+                    keep_balancing = cutlass.Boolean(False)
+                else:
+                    max_remaining, selected_expert_id = reg_scan_argmax_min_idx(
+                        owner_remaining, epn, lane)
+                    if max_remaining <= 0:
+                        keep_balancing = cutlass.Boolean(False)
+                    else:
+                        take = cutlass.min(max_remaining, max_quota)
+                        for j in cutlass.range_constexpr(R_CHUNK):
+                            rank_idx = lane + j * 32
+                            if rank_idx == target_rank: quotas[j] = max_quota - take
+                        for j in cutlass.range_constexpr(EPN_CHUNK):
+                            local_expert_id = lane + j * 32
+                            if local_expert_id == selected_expert_id:
+                                owner_remaining[j] = max_remaining - take
+                        if tid == 0:
+                            s_alloc[target_rank, selected_expert_id] += take
+                            s_alloc[owner_rank, selected_expert_id] = max_remaining - take
+                        cute.arch.sync_warp()
+        cute.arch.barrier()
+
+        for idx in cutlass.range(tid, epn * R, num_threads):
+            rank_idx = idx // epn
+            local_expert_id = idx - rank_idx * epn
+            global_expert = expert_base + local_expert_id
+            alloc[rank_idx, global_expert] = (
+                s_alloc[rank_idx, local_expert_id]
+            )
+
+        cute.arch.barrier()
+
+        for local_expert_id in cutlass.range(tid, epn, num_threads):
+            cum = 0
+            for rank_idx in cutlass.range_constexpr(R):
+                cum += s_alloc[rank_idx, local_expert_id]
+                s_alloc[rank_idx, local_expert_id] = cum
+
+        cute.arch.barrier()
+
+        for idx in cutlass.range(tid, epn * R, num_threads):
+            local_expert_id = idx // R
+            rank_idx = idx - local_expert_id * R
+            global_expert = expert_base + local_expert_id
+            alloc_cumsum[global_expert, rank_idx] = (
+                s_alloc[rank_idx, local_expert_id]
+            )
+
+        cute.arch.barrier()
+
+
+def make_injected_step3(policy):
+    """Wrap an out-of-tree policy so it also produces the alloc_cumsum prefix.
+
+    The policy owns z[R, R] and alloc[R, E]; alloc_cumsum is mechanism, and the
+    builtin fuses it into its shared-memory pass, so it is recomputed here.
+    """
+
+    @cute.jit
+    def injected_step3(
+        group_tokens, z_tensor, alloc, alloc_cumsum, tpe_cumsum, s_alloc,
+        *, R, E, epn, CAP, bar_p, num_sms, num_threads, pid, tid,
+    ):
+        policy(
+            group_tokens, z_tensor, alloc, tpe_cumsum, s_alloc,
+            R=R, E=E, epn=epn, CAP=CAP, bar=bar_p, num_sms=num_sms,
+            num_threads=num_threads, pid=pid, tid=tid,
+        )
+        grid_sync(bar_p, num_sms, tid)
+        # alloc_cumsum[e, d] = sum_{d'<=d} alloc[d', e], consumed by the C2
+        # binary search that resolves each token's destination.
+        for e in cutlass.range(pid * num_threads + tid, E, num_sms * num_threads):
+            cum = Int32(0)
+            for d in cutlass.range_constexpr(R):
+                cum += alloc[d, e]
+                alloc_cumsum[e, d] = cum
+
+    return injected_step3
+
 class PlanningKernel:
     def __init__(self, R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                  TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
                  token_padding, num_sms, alloc_policy=None):
-        # alloc_policy is a compile-time constant: None selects the fused
-        # builtin path below, which is emitted verbatim so it stays bit- and
-        # perf-identical to the pre-hook kernel.
+        # Resolve step 3 here, in Python, so the kernel body contains a single
+        # unconditional call and the builtin path traces to exactly the code it
+        # did before the hook existed.
         self.alloc_policy = alloc_policy
+        self.step3 = (
+            builtin_greedy_step3 if alloc_policy is None
+            else make_injected_step3(alloc_policy)
+        )
         self.R, self.E, self.B, self.S, self.K = R, E, B, S, K
         self.N = self.S * self.K
         self.NvS_capacity, self.NvS, self.num_vblocks = NvS_capacity, NvS, num_vblocks
@@ -674,169 +837,27 @@ class PlanningKernel:
                 cute.arch.barrier()
             grid_sync(bar_p, num_sms, tid)
             # ---- step 3: allocation policy ------------------------------
-            # The whole region up to the next grid_sync is the policy. With
-            # alloc_policy=None the original fused code runs unchanged; an
-            # injected policy replaces it and the alloc_cumsum derivation --
-            # pure mechanism -- is recomputed from alloc afterwards.
-            if cutlass.const_expr(self.alloc_policy is None):
-              if pid == 0:
-                if tid < 32:
-                    lane = tid
-                    # balance stays in registers throughout: lane holds
-                    # bal[j]=group_tokens[lane+j*32]-CAP, CHUNK=ceil(R/32).
-                    CHUNK = cutlass.const_expr(ceil_div(R, 32))
-                    balance = cute.make_rmem_tensor(CHUNK, Int32)
-                    for j in cutlass.range_constexpr(CHUNK):
-                        k = lane + j * 32
-                        balance[j] = 0
-                        if k < R: balance[j] = group_tokens[k] - CAP
-                    keep_balancing = True
-                    while keep_balancing:
-                        # surplus takes max (larger balance first, smaller rank
-                        # on ties); deficit takes min (larger shortfall first,
-                        # smaller rank on ties).
-                        surplus, surplus_rank = reg_scan_argmax_min_idx(balance, R, lane)
-                        deficit, deficit_rank = reg_scan_argmin_min_idx(balance, R, lane)
-                        if surplus <= 0 or deficit >= 0:
-                            keep_balancing = False
-                        else:
-                            # The move amount is limited by the receiver's
-                            # shortfall; refill deficit_rank back to CAP in one shot.
-                            move_tokens = -deficit
-                            for j in cutlass.range_constexpr(CHUNK):
-                                k = lane + j * 32
-                                if k == surplus_rank: balance[j] -= move_tokens
-                                elif k == deficit_rank: balance[j] = 0
-                            if lane == 0:
-                                z_tensor[surplus_rank, deficit_rank] = move_tokens
-                            cute.arch.sync_warp()
-              grid_sync(bar_p, num_sms, tid)
-              # alloc_by_rank[rank, expert] feeds step4; alloc_prefix[expert, rank]
-              # stores the cumulative counts consumed by C2 binary search.
-              alloc_cumsum = cute.make_tensor(
-                  meta.iterator + (PB + ALLOC_SUB),
-                  cute.make_layout((E, R), stride=(R, 1)),
-              )
-              alloc_tensor = cute.make_tensor(
-                  alloc.iterator,
-                  cute.make_layout((R, E), stride=(E, 1)),
-              )
-              s_alloc = cute.make_tensor(
-                  scratch.iterator,
-                  cute.make_layout((R, epn), stride=(epn, 1)),
-              )
-              for owner_rank in cutlass.range(pid, R, num_sms):
-                  expert_base = owner_rank * epn
-
-                  for idx in cutlass.range(tid, epn * R, num_threads):
-                      local_expert_id = idx // R
-                      rank_idx = idx - local_expert_id * R
-                      global_expert = expert_base + local_expert_id
-                      s_alloc[rank_idx, local_expert_id] = (
-                          tpe_cumsum[R - 1, global_expert] if rank_idx == owner_rank else 0
-                      )
-
-                  cute.arch.barrier()
-
-                  if tid < 32:
-                      lane = tid
-                      R_CHUNK = cutlass.const_expr(ceil_div(R, 32))
-                      EPN_CHUNK = cutlass.const_expr(ceil_div(epn, 32))
-                      quotas = cute.make_rmem_tensor(R_CHUNK, Int32)
-                      owner_remaining = cute.make_rmem_tensor(EPN_CHUNK, Int32)
-                      for j in cutlass.range_constexpr(R_CHUNK):
-                          rank_idx = lane + j * 32
-                          quotas[j] = 0
-                          if rank_idx < R: quotas[j] = z_tensor[owner_rank, rank_idx]
-                      for j in cutlass.range_constexpr(EPN_CHUNK):
-                          local_expert_id = lane + j * 32
-                          owner_remaining[j] = 0
-                          if local_expert_id < epn:
-                              owner_remaining[j] = s_alloc[owner_rank, local_expert_id]
-
-                      keep_balancing = cutlass.Boolean(True)
-                      while keep_balancing:
-                          max_quota, target_rank = reg_scan_argmax_min_idx(quotas, R, lane)
-                          if max_quota <= 0:
-                              keep_balancing = cutlass.Boolean(False)
-                          else:
-                              max_remaining, selected_expert_id = reg_scan_argmax_min_idx(
-                                  owner_remaining, epn, lane)
-                              if max_remaining <= 0:
-                                  keep_balancing = cutlass.Boolean(False)
-                              else:
-                                  take = cutlass.min(max_remaining, max_quota)
-                                  for j in cutlass.range_constexpr(R_CHUNK):
-                                      rank_idx = lane + j * 32
-                                      if rank_idx == target_rank: quotas[j] = max_quota - take
-                                  for j in cutlass.range_constexpr(EPN_CHUNK):
-                                      local_expert_id = lane + j * 32
-                                      if local_expert_id == selected_expert_id:
-                                          owner_remaining[j] = max_remaining - take
-                                  if tid == 0:
-                                      s_alloc[target_rank, selected_expert_id] += take
-                                      s_alloc[owner_rank, selected_expert_id] = max_remaining - take
-                                  cute.arch.sync_warp()
-                  cute.arch.barrier()
-
-                  for idx in cutlass.range(tid, epn * R, num_threads):
-                      rank_idx = idx // epn
-                      local_expert_id = idx - rank_idx * epn
-                      global_expert = expert_base + local_expert_id
-                      alloc_tensor[rank_idx, global_expert] = (
-                          s_alloc[rank_idx, local_expert_id]
-                      )
-
-                  cute.arch.barrier()
-
-                  for local_expert_id in cutlass.range(tid, epn, num_threads):
-                      cum = 0
-                      for rank_idx in cutlass.range_constexpr(R):
-                          cum += s_alloc[rank_idx, local_expert_id]
-                          s_alloc[rank_idx, local_expert_id] = cum
-
-                  cute.arch.barrier()
-
-                  for idx in cutlass.range(tid, epn * R, num_threads):
-                      local_expert_id = idx // R
-                      rank_idx = idx - local_expert_id * R
-                      global_expert = expert_base + local_expert_id
-                      alloc_cumsum[global_expert, rank_idx] = (
-                          s_alloc[rank_idx, local_expert_id]
-                      )
-
-                  cute.arch.barrier()
-            else:
-              # Injected policy: it owns z[R,R] and alloc[R,E] only. Views are
-              # rebuilt here rather than hoisted so the builtin branch above
-              # stays byte-for-byte the code it was before the hook existed.
-              alloc_tensor = cute.make_tensor(
-                  alloc.iterator,
-                  cute.make_layout((R, E), stride=(E, 1)),
-              )
-              alloc_cumsum = cute.make_tensor(
-                  meta.iterator + (PB + ALLOC_SUB),
-                  cute.make_layout((E, R), stride=(R, 1)),
-              )
-              s_alloc = cute.make_tensor(
-                  scratch.iterator,
-                  cute.make_layout((R, epn), stride=(epn, 1)),
-              )
-              self.alloc_policy(
-                  group_tokens, z_tensor, alloc_tensor, tpe_cumsum, s_alloc,
-                  R=R, E=E, epn=epn, CAP=CAP, bar=bar_p, num_sms=num_sms,
-                  num_threads=num_threads, pid=pid, tid=tid,
-              )
-              grid_sync(bar_p, num_sms, tid)
-              # Mechanism, not policy: alloc_cumsum[e, d] = sum_{d'<=d} alloc[d', e],
-              # consumed by the C2 binary search that resolves each token's dest.
-              # The builtin branch fuses this into its shared-memory pass; here we
-              # recompute it from alloc so any policy gets it for free.
-              for e in cutlass.range(pid * num_threads + tid, E, num_sms * num_threads):
-                  cum = Int32(0)
-                  for d in cutlass.range_constexpr(R):
-                      cum += alloc_tensor[d, e]
-                      alloc_cumsum[e, d] = cum
+            # ---- step 3: allocation policy ----------------------------
+            # Views are built here so both the builtin and injected step 3 see
+            # an identical signature; construction is address arithmetic only.
+            alloc_cumsum = cute.make_tensor(
+                meta.iterator + (PB + ALLOC_SUB),
+                cute.make_layout((E, R), stride=(R, 1)),
+            )
+            alloc_tensor = cute.make_tensor(
+                alloc.iterator,
+                cute.make_layout((R, E), stride=(E, 1)),
+            )
+            s_alloc = cute.make_tensor(
+                scratch.iterator,
+                cute.make_layout((R, epn), stride=(epn, 1)),
+            )
+            self.step3(
+                group_tokens, z_tensor, alloc_tensor, alloc_cumsum, tpe_cumsum,
+                s_alloc,
+                R=R, E=E, epn=epn, CAP=CAP, bar_p=bar_p, num_sms=num_sms,
+                num_threads=num_threads, pid=pid, tid=tid,
+            )
             grid_sync(bar_p, num_sms, tid)
             expert_offsets = cute.make_tensor(
                 meta.iterator + (PB + EOFF_SUB),
