@@ -79,16 +79,25 @@ while any deficit remains. Every destination rank therefore receives from **at
 most one home group**, giving it at most `epn` own experts plus at most `epn`
 received experts.
 
-A replacement policy must reproduce this *structural* property, not merely the
-resulting count. `test_segment_bound_is_tight_not_incidental` asserts the
-mechanism (one donor group per receiver), so a policy that happens to stay under
-`2*epn` by luck still fails.
+**The one-donor property is sufficient, not necessary.** What the buffer
+actually requires is the *count*: at most `2*epn` non-empty groups per
+destination rank, because that is how many `token_padding - 1` roundings the
+headroom pays for. A policy may take from several home groups provided the
+number of distinct *received* experts on any rank stays within `epn`. That
+freedom is real and is where a better policy has room to work.
 
-This is the single largest constraint on the design space: a naive waterfill or
+`test_segment_bound_is_tight_not_incidental` asserts the one-donor mechanism,
+but it is a *characterization test of the builtin*, not part of the contract:
+`check_policy` deliberately runs only `alloc_invariant_errors`, i.e. the count
+bound. Do not extend the donor assertion to third-party policies.
+
+This is still the largest constraint on the design space: a naive waterfill or
 LP formulation that optimizes only max-rank-load will violate invariant 4
 immediately, because spreading load finely across ranks is exactly what it wants
-to do. Raising the bound is possible but is an **ABI change** — it changes `NvS`
-and therefore every buffer size in `_create_context`.
+to do. Any such formulation needs an explicit cardinality constraint on
+non-zero entries per row. Raising the bound itself is possible but is an **ABI
+change** — it changes `NvS` and therefore every buffer size in
+`_create_context`.
 
 ## Quality metrics (not invariants)
 

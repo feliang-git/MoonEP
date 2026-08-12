@@ -196,23 +196,3 @@ def test_contract_rejects_a_violating_policy():
     bad = bad.to(torch.int32)
     errs = alloc_invariant_errors(bad, tpe_wide, geom_wide)
     assert any("invariant 4" in e for e in errs), errs
-
-
-def check_policy(policy_fn, *, geometries=GEOMETRIES, kinds=TPE_KINDS, seed=1234):
-    """Run the full conformance suite against an arbitrary policy.
-
-    Args:
-        policy_fn: ``(tpe: [R,E] int32, geom: AllocGeometry) -> alloc [R,E] int32``
-
-    Returns:
-        ``{(geom_id, kind): [error, ...]}`` for every non-conforming case.
-    """
-    failures = {}
-    for geom in geometries:
-        gid = f"R{geom.R}_E{geom.E}_S{geom.S}_K{geom.K}_tp{geom.token_padding}"
-        for kind in kinds:
-            tpe = make_tpe(kind, geom, seed=seed)
-            errors = alloc_invariant_errors(policy_fn(tpe, geom), tpe, geom)
-            if errors:
-                failures[(gid, kind)] = errors
-    return failures
