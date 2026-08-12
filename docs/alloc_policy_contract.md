@@ -9,14 +9,20 @@ replaced without touching the communication backend.
 
 | Step | Where | Role |
 |---|---|---|
-| 1. local histogram | `planning.py:399` (`run_c1`) | mechanism |
-| 2. cross-rank `tpe` exchange | `planning.py:609` | mechanism |
-| **3. allocation policy** | **`planning.py:673–798`** | **policy** |
-| 4. table build | `planning.py:833+` | mechanism |
+| 1. local histogram | `planning.py:567` (`run_c1`) | mechanism |
+| 2. cross-rank `tpe` exchange | in-kernel `cross_rank_barrier` | mechanism |
+| **3. allocation policy** | **`planning.py:855`, dispatching to `builtin_greedy_step3` (`:365`) or `make_injected_step3` (`:485`)** | **policy** |
+| 4. table build | `planning.py:862+` | mechanism |
 
-Step 3 is bounded by `grid_sync` at `planning.py:670` and `planning.py:798`. It
-reads `group_tokens[R]` (and the exchanged `tpe` in the multicast `meta`
-buffer) and writes `z[R,R]` and `alloc[R,E]`.
+Step 3 is a single unconditional call sandwiched between two grid-wide
+barriers. It reads `group_tokens[R]` and `tpe_cumsum`, and writes `z[R,R]` and
+`alloc[R,E]`.
+
+The variant is chosen in **Python**, at `PlanningKernel` construction, not with
+a `cutlass.const_expr` branch in the kernel body. That is deliberate: wrapping
+the region in a DSL conditional cost 14–22% on skewed inputs, where the greedy
+while-loops iterate most. Resolving it before tracing keeps the builtin path
+exactly the code it always was.
 
 Everything in step 4 — `expert_off`, `cu_seqlens`, `experts_to_copy`,
 `zero_fill_ranges`, `remote_stats`, `dst` — is a **pure function of `alloc`**.
@@ -36,7 +42,7 @@ it is an existing, already-tested intermediate being promoted to a boundary.
 
 ## Invariants
 
-A conforming policy must satisfy all five. `tests/alloc_contract.py` implements
+A conforming policy must satisfy all five. `moonep/alloc_contract.py` implements
 the checker; `tests/test_alloc_contract.py` runs it over adversarial inputs and
 includes a negative control proving each check can actually fire.
 
@@ -51,7 +57,7 @@ includes a negative control proving each check can actually fire.
 
 ### Invariant 4 is the one that will bite you
 
-It is stated nowhere upstream, but it is load-bearing. `api.py:278` sizes the
+It is stated nowhere upstream, but it is load-bearing. `api.py:283` sizes the
 dispatch buffer as:
 
 ```python
@@ -103,10 +109,14 @@ change** — it changes `NvS` and therefore every buffer size in
 
 - **B-pressure** — per destination rank, the count of non-empty *remote* expert
   groups. Step 4 grants weight-prefetch slots to only the top-`B` of these
-  (`planning_reference.py:158`). Beyond `B`, remote experts still compute
+  (`planning_reference.py:160`). Beyond `B`, remote experts still compute
   correctly but are not prefetched: a silent throughput cliff, not an error.
   `alloc` alone cannot express this budget, so policies must be *measured* on
-  it. `tests/alloc_contract.py:b_pressure` reports it.
+  it. `moonep/alloc_contract.py:168` (`b_pressure`) reports it.
+  **Caveat:** under the default `B = E // R = epn`, invariant 4 already caps
+  received experts per rank at `epn`, so `b_pressure <= B` holds by
+  construction and this metric can never fire. It only becomes meaningful if a
+  caller sets `B < epn`. Measured 0/38 cases over `B`.
 - **Max rank load** — `alloc.sum(dim=1).max()`, the objective being minimized.
 - **Migration volume** — total tokens placed off their home rank. Each migrated
   expert costs a weight prefetch, so at equal max load, less migration is
@@ -120,8 +130,8 @@ Selection is a **compile-time** parameter (it participates in the
 
 ```python
 Buffer(S, H, K, E, R, alloc_policy="builtin")   # default; upstream fast path
-Buffer(..., alloc_policy="mlb:greedy")          # injected from MLB
-Buffer(..., alloc_policy="torch")               # host fallback, for development
+Buffer(..., alloc_policy="reference_greedy")    # in-tree, exercises the hook
+Buffer(..., alloc_policy="mlb:greedy")          # registered by MLB, out-of-tree
 ```
 
 - `"builtin"` — the current code, unchanged, always the default. The upstream
@@ -129,23 +139,36 @@ Buffer(..., alloc_policy="torch")               # host fallback, for development
 - `"mlb:<name>"` — a `@cute.jit` device function supplied out-of-tree and
   inlined between the existing `grid_sync` barriers. One kernel launch, no added
   overhead.
-- `"torch"` — runs steps 1–2, copies the exchanged `tpe` to host, calls a plain
-  PyTorch policy, copies `alloc` back, runs step 4. Slow by design; it makes
-  policy development a pure-Python loop and gives the differential test its
-  oracle.
+There is no in-kernel host-fallback mode. Host-side policy development uses
+`tests/planning_reference.py`, which already implements all four planning steps
+in PyTorch and exposes the seam via `launch_planning_torch_reference(...,
+return_alloc=True)` — that is the differential oracle, and it needs no GPU.
+
+Device building blocks a policy may use are re-exported from
+`moonep.policy_toolkit` (grid barrier, warp argmax/argmin scans, `ceil_div`).
+That module is the supported surface; the rest of `moonep.planning` and
+`moonep._common` is not.
 
 ### Device-function signature
 
 ```python
 @cute.jit
-def alloc_policy(group_tokens, z, alloc, meta, R, E, epn, CAP, bar, num_sms, tid) -> None:
-    """Read group_tokens (and tpe via meta); write z[R,R] and alloc[R,E].
+def alloc_policy(group_tokens, z, alloc, tpe_cumsum, s_alloc,
+                 *, R, E, epn, CAP, bar, num_sms, num_threads, pid, tid) -> None:
+    """Write z[R,R] and alloc[R,E]. Nothing else.
 
-    Must grid_sync internally if it needs more than one barrier phase.
-    Must not write dst, cu_seqlens, experts_to_copy, zero_fill_ranges or
-    remote_stats -- those belong to step 4.
+    group_tokens[R]      per-rank token load if nothing migrates
+    tpe_cumsum[R-1, e]   global token count of expert e
+    s_alloc[R, epn]      shared-memory scratch, contents undefined on entry
+
+    Use grid_sync (from moonep.policy_toolkit) for cross-CTA ordering and
+    cute.arch.barrier() for intra-CTA. Must not write dst, cu_seqlens,
+    experts_to_copy, zero_fill_ranges or remote_stats -- those are step 4.
     """
 ```
+
+`moonep/policies/reference_greedy.py` and MLB's
+`kernels/moonep/policy.py` are both working examples.
 
 ### Host-function signature
 
@@ -159,7 +182,7 @@ def alloc_policy_torch(tpe: Tensor[R, E], geom: AllocGeometry) -> Tensor[R, E]:
 An out-of-tree policy is expected to import the shared suite:
 
 ```python
-from tests.alloc_contract import check_policy
+from moonep.alloc_contract import check_policy
 failures = check_policy(my_policy)   # {(geometry, tpe_kind): [errors]}
 assert not failures
 ```
